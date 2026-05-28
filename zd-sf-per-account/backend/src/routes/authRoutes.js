@@ -1,9 +1,18 @@
 // src/routes/authRoutes.js
-// FIXED: postMessage now sends to all possible parent windows
-// + sessionStorage fallback for Zendesk iFrame restrictions
+// FINAL FIX: Cross-origin postMessage cannot work between Railway and Zendesk domains.
+//
+// NEW FLOW:
+// 1. OAuth completes → backend stores tokens in pendingTokens (memory, 5min TTL)
+// 2. Callback page shows success UI + tells user to close window
+// 3. app.js polls GET /auth/salesforce/pending?subdomain=xxx every second
+// 4. When tokens found → sidebar saves them → loads contact → stops polling
+//
+// This avoids ALL cross-origin messaging issues.
+
 const express = require('express');
 const router = express.Router();
 const salesforceAuth = require('../auth/salesforceAuth');
+const pendingTokens = require('../utils/pendingTokens');
 const logger = require('../utils/logger');
 
 // ── Step 1: Initiate OAuth ────────────────────────────────────────────
@@ -25,37 +34,56 @@ router.get('/salesforce/initiate', (req, res) => {
 });
 
 // ── Step 2: OAuth Callback ────────────────────────────────────────────
+// After SF login, tokens are stored in pendingTokens (backend memory).
+// The sidebar polls /auth/salesforce/pending to pick them up.
 router.get('/salesforce/callback', async (req, res) => {
   const { code, state, error, error_description } = req.query;
 
   if (error) {
-    logger.warn('SF returned OAuth error', { error, error_description });
-    return res.send(popupClosePage({
-      type: 'SF_AUTH_ERROR',
-      error: error_description || error,
-    }));
+    logger.warn('SF OAuth error', { error, error_description });
+    return res.send(resultPage(false, error_description || error));
   }
 
   if (!code || !state) {
-    return res.status(400).send(errorPage('Missing code or state parameter.'));
+    return res.status(400).send(errorPage('Missing code or state.'));
   }
 
   try {
     const tokenPayload = await salesforceAuth.exchangeCodeForTokens(code, state);
-    logger.info('OAuth complete', { subdomain: tokenPayload.subdomain, orgId: tokenPayload.orgId });
+    logger.info('OAuth complete', { subdomain: tokenPayload.subdomain });
 
-    return res.send(popupClosePage({
-      type: 'SF_AUTH_SUCCESS',
-      ...tokenPayload,
-    }));
+    // Store tokens in backend memory — sidebar will poll and pick these up
+    pendingTokens.set(tokenPayload.subdomain, tokenPayload);
+
+    // Show success page — no postMessage needed anymore
+    return res.send(resultPage(true, null, tokenPayload.subdomain));
 
   } catch (err) {
     logger.error('Callback error', { error: err.message });
-    return res.send(popupClosePage({
-      type: 'SF_AUTH_ERROR',
-      error: err.message,
-    }));
+    return res.send(resultPage(false, err.message));
   }
+});
+
+// ── Step 3: Sidebar polls this endpoint ──────────────────────────────
+// GET /auth/salesforce/pending?subdomain=test
+// Returns tokens if available (one-time), or 404 if not ready yet.
+// app.js polls this every second after opening the popup.
+router.get('/salesforce/pending', (req, res) => {
+  const { subdomain } = req.query;
+
+  if (!subdomain) {
+    return res.status(400).json({ error: 'subdomain required' });
+  }
+
+  const tokens = pendingTokens.consume(subdomain);
+
+  if (!tokens) {
+    // Not ready yet — sidebar will retry
+    return res.status(404).json({ ready: false });
+  }
+
+  logger.info('Pending tokens delivered to sidebar', { subdomain });
+  return res.json({ ready: true, ...tokens });
 });
 
 // ── Token Refresh ─────────────────────────────────────────────────────
@@ -68,7 +96,7 @@ router.post('/salesforce/refresh', async (req, res) => {
 
   try {
     const tokens = await salesforceAuth.refreshAccessToken(refreshToken);
-    logger.info('Token refreshed via /refresh endpoint');
+    logger.info('Token refreshed');
     return res.json(tokens);
   } catch (err) {
     logger.error('Token refresh failed', { error: err.message });
@@ -84,37 +112,20 @@ router.post('/salesforce/revoke', async (req, res) => {
   const { accessToken, instanceUrl } = req.body;
 
   if (!accessToken || !instanceUrl) {
-    return res.status(400).json({ error: 'accessToken and instanceUrl are required' });
+    return res.status(400).json({ error: 'accessToken and instanceUrl required' });
   }
 
   await salesforceAuth.revokeToken(accessToken, instanceUrl);
   return res.json({ success: true });
 });
 
-// ── Helpers ───────────────────────────────────────────────────────────
+// ── HTML Helpers ──────────────────────────────────────────────────────
 
-/**
- * FIXED popupClosePage:
- *
- * Problem: Zendesk sidebar runs inside an iFrame.
- * window.opener points to the iFrame, NOT the top-level Zendesk window.
- * Standard postMessage to window.opener gets filtered by Zendesk's iFrame sandbox.
- *
- * Solution:
- * 1. Try posting to window.opener (the iFrame itself)
- * 2. Try posting to window.opener.parent (the Zendesk parent frame)
- * 3. Try BroadcastChannel API (works across same-origin contexts)
- * 4. Store result in sessionStorage as final fallback
- *    (app.js polls sessionStorage every 500ms while popup is open)
- */
-function popupClosePage(payload) {
-  const json = JSON.stringify(payload);
-  const isSuccess = payload.type === 'SF_AUTH_SUCCESS';
-
+function resultPage(success, errorMsg, subdomain) {
   return `<!DOCTYPE html>
 <html>
 <head>
-  <title>Salesforce Auth</title>
+  <title>${success ? 'Connected!' : 'Auth Failed'}</title>
   <style>
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -122,81 +133,31 @@ function popupClosePage(payload) {
       min-height: 100vh; margin: 0; background: #f8f9f9;
     }
     .card {
-      background: white; border-radius: 10px; padding: 36px 44px;
-      text-align: center; box-shadow: 0 2px 16px rgba(0,0,0,0.1);
-      max-width: 360px;
+      background: white; border-radius: 12px; padding: 40px 48px;
+      text-align: center; box-shadow: 0 4px 24px rgba(0,0,0,0.1);
+      max-width: 380px;
     }
-    .icon { font-size: 48px; margin-bottom: 16px; }
-    h3 { margin: 0 0 8px; color: #2f3941; font-size: 16px; }
-    p { color: #68737d; font-size: 13px; margin: 0; }
+    .icon { font-size: 52px; margin-bottom: 16px; }
+    h2 { margin: 0 0 10px; color: #2f3941; font-size: 18px; }
+    p { color: #68737d; font-size: 13px; line-height: 1.6; margin: 0; }
+    .close-btn {
+      margin-top: 20px; padding: 10px 28px;
+      background: #0070d2; color: white; border: none;
+      border-radius: 6px; font-size: 14px; cursor: pointer;
+    }
+    .close-btn:hover { background: #005fb2; }
   </style>
 </head>
 <body>
   <div class="card">
-    <div class="icon">${isSuccess ? '✅' : '❌'}</div>
-    <h3>${isSuccess ? 'Connected to Salesforce!' : 'Authentication Failed'}</h3>
-    <p>${isSuccess ? 'This window will close automatically…' : (payload.error || 'Please try again.')}</p>
+    <div class="icon">${success ? '✅' : '❌'}</div>
+    <h2>${success ? 'Salesforce Connected!' : 'Authentication Failed'}</h2>
+    <p>${success
+      ? 'Your Zendesk account is now connected to Salesforce.<br>You can close this window — the sidebar will update automatically.'
+      : (errorMsg || 'Something went wrong. Please close this window and try again.')
+    }</p>
+    <button class="close-btn" onclick="window.close()">Close Window</button>
   </div>
-
-  <script>
-    (function() {
-      var payload = ${json};
-      var sent = false;
-
-      // METHOD 1: Try window.opener directly (works if sidebar is top-level)
-      try {
-        if (window.opener && !window.opener.closed) {
-          window.opener.postMessage(payload, '*');
-          sent = true;
-          console.log('[SF Callback] postMessage sent to window.opener');
-        }
-      } catch(e) {
-        console.warn('[SF Callback] window.opener postMessage failed:', e);
-      }
-
-      // METHOD 2: Try window.opener.parent (Zendesk iFrame case)
-      try {
-        if (window.opener && window.opener.parent && !window.opener.parent.closed) {
-          window.opener.parent.postMessage(payload, '*');
-          sent = true;
-          console.log('[SF Callback] postMessage sent to window.opener.parent');
-        }
-      } catch(e) {
-        console.warn('[SF Callback] window.opener.parent postMessage failed:', e);
-      }
-
-      // METHOD 3: BroadcastChannel (same-origin, modern browsers)
-      try {
-        var bc = new BroadcastChannel('sf_oauth_channel');
-        bc.postMessage(payload);
-        bc.close();
-        sent = true;
-        console.log('[SF Callback] BroadcastChannel message sent');
-      } catch(e) {
-        console.warn('[SF Callback] BroadcastChannel failed:', e);
-      }
-
-      // METHOD 4: sessionStorage fallback (app.js polls this every 500ms)
-      // This is the most reliable fallback for iFrame environments
-      try {
-        sessionStorage.setItem('sf_auth_result', JSON.stringify(payload));
-        console.log('[SF Callback] Stored in sessionStorage as fallback');
-      } catch(e) {
-        console.warn('[SF Callback] sessionStorage failed:', e);
-      }
-
-      // METHOD 5: localStorage fallback (app.js also polls this)
-      try {
-        localStorage.setItem('sf_auth_pending', JSON.stringify(payload));
-        console.log('[SF Callback] Stored in localStorage as fallback');
-      } catch(e) {
-        console.warn('[SF Callback] localStorage fallback failed:', e);
-      }
-
-      console.log('[SF Callback] All methods attempted. Closing in 2s...');
-      setTimeout(function() { window.close(); }, 2000);
-    })();
-  </script>
 </body>
 </html>`;
 }
