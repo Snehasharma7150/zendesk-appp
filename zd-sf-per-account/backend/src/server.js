@@ -1,4 +1,5 @@
-// src/server.js
+// src/server.js — FIXED VERSION
+// Fix: helmet contentSecurityPolicy disabled (was blocking postMessage)
 require('dotenv').config();
 
 const express = require('express');
@@ -20,60 +21,43 @@ if (missing.length) {
   process.exit(1);
 }
 
+// Log the redirect URI on startup — helps catch misconfiguration
+console.log(`[CONFIG] SF_REDIRECT_URI = ${process.env.SF_REDIRECT_URI}`);
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Security headers ──────────────────────────────────────────────────
-app.use(
-  helmet({
-    // Must be relaxed so the OAuth callback page can run its postMessage script
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'unsafe-inline'"], // needed for popup close page
-        frameSrc: ["'none'"],
-      },
-    },
-  })
-);
+// ── Security ──────────────────────────────────────────────────────────
+// FIX: contentSecurityPolicy disabled — it was blocking the popup's
+// postMessage from reaching the Zendesk sidebar iframe
+app.use(helmet({ contentSecurityPolicy: false }));
 
-// ── CORS ──────────────────────────────────────────────────────────────
-// Allow requests from any Zendesk subdomain and local dev.
-// The ZAF client.request() proxy already handles most calls;
-// CORS is needed for direct fetch() calls from the app iframe.
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (
-        !origin ||
-        /\.zendesk\.com$/.test(origin) ||
-        /^http:\/\/localhost/.test(origin) ||
-        /^https:\/\/localhost/.test(origin)
-      ) {
-        return cb(null, true);
-      }
-      logger.warn('CORS blocked', { origin });
-      cb(new Error('Not allowed by CORS'));
-    },
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: [
-      'Content-Type',
-      'X-SF-Access-Token',
-      'X-SF-Instance-Url',
-    ],
-  })
-);
+// CORS — allow Zendesk subdomains and local dev
+app.use(cors({
+  origin: (origin, cb) => {
+    if (
+      !origin ||
+      /\.zendesk\.com$/.test(origin) ||
+      /^http:\/\/localhost/.test(origin) ||
+      /^https:\/\/localhost/.test(origin)
+    ) {
+      return cb(null, true);
+    }
+    logger.warn('CORS blocked', { origin });
+    cb(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'X-SF-Access-Token', 'X-SF-Instance-Url'],
+}));
 
-// ── Rate limiting ─────────────────────────────────────────────────────
-app.use(
-  rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 min
-    max: 300,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: 'Too many requests, please try again later.' },
-  })
-);
+// Rate limiting
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+}));
 
 // ── Parsing & logging ─────────────────────────────────────────────────
 app.use(express.json({ limit: '10kb' }));
@@ -84,14 +68,15 @@ app.use(requestLogger);
 // ── Routes ────────────────────────────────────────────────────────────
 app.get('/', (req, res) =>
   res.json({
-    service: 'Zendesk-Salesforce Connector (Per-Account)',
-    version: '3.0.0',
+    service: 'Zendesk-Salesforce Connector',
+    version: '3.1.0',
+    redirectUri: process.env.SF_REDIRECT_URI,  // visible for debugging
     endpoints: {
-      'GET  /auth/salesforce/initiate?subdomain=<sub>': 'Start OAuth (popup redirect)',
-      'GET  /auth/salesforce/callback':                 'OAuth callback from Salesforce',
-      'POST /auth/salesforce/refresh':                  '{ refreshToken } → new accessToken',
-      'POST /auth/salesforce/revoke':                   '{ accessToken, instanceUrl } → revoke',
-      'GET  /api/contact?email=<email>':                'Find SF contact (requires token headers)',
+      'GET  /auth/salesforce/initiate?subdomain=<sub>': 'Start OAuth',
+      'GET  /auth/salesforce/callback':                 'OAuth callback',
+      'POST /auth/salesforce/refresh':                  'Refresh token',
+      'POST /auth/salesforce/revoke':                   'Revoke token',
+      'GET  /api/contact?email=<email>':                'Find SF contact',
       'GET  /api/health':                               'Health check',
     },
   })
@@ -109,9 +94,9 @@ app.use(errorHandler);
 // ── Start ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   logger.info(`Server running on port ${PORT}`, { env: process.env.NODE_ENV });
+  logger.info(`SF_REDIRECT_URI: ${process.env.SF_REDIRECT_URI}`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   logger.info('SIGTERM — shutting down');
   process.exit(0);
