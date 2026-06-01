@@ -1,11 +1,4 @@
 // src/services/salesforceService.js
-/**
- * Salesforce REST API — stateless.
- *
- * Every function receives { accessToken, instanceUrl } directly.
- * The backend holds no tokens. The caller (frontend via HTTP request body/query)
- * supplies the credentials it retrieved from ZAF metadata.
- */
 const axios = require('axios');
 const logger = require('../utils/logger');
 
@@ -22,48 +15,138 @@ function buildClient(accessToken, instanceUrl) {
   });
 }
 
-// ── Contact ───────────────────────────────────────────────────────────
-
 async function findContactByEmail(accessToken, instanceUrl, email) {
   const client = buildClient(accessToken, instanceUrl);
   const safeEmail = email.replace(/'/g, "\\'");
 
-  const soql = [
-    'SELECT Id,Name,FirstName,LastName,Email,Phone,MobilePhone,Title,Department,',
-    'Account.Id,Account.Name,Account.Industry,Account.BillingCity,Account.BillingCountry,',
-    'Account.Website,Account.Owner.Name,Account.NumberOfEmployees,LastModifiedDate',
-    ` FROM Contact WHERE Email='${safeEmail}'`,
-    ' ORDER BY LastModifiedDate DESC LIMIT 1',
-  ].join('');
+  // ── Maximum Contact + Account fields ────────────────────────────────
+  const soql = `
+    SELECT
+      Id,
+      FirstName,
+      LastName,
+      Name,
+      Email,
+      Phone,
+      MobilePhone,
+      HomePhone,
+      Title,
+      Department,
+      Birthdate,
+      LeadSource,
+      Description,
+      MailingStreet,
+      MailingCity,
+      MailingState,
+      MailingPostalCode,
+      MailingCountry,
+      OtherPhone,
+      Fax,
+      ReportsToId,
+      CreatedDate,
+      LastModifiedDate,
+      LastActivityDate,
+      Owner.Name,
+      Owner.Email,
+      Account.Id,
+      Account.Name,
+      Account.Type,
+      Account.Industry,
+      Account.Phone,
+      Account.Fax,
+      Account.Website,
+      Account.AnnualRevenue,
+      Account.NumberOfEmployees,
+      Account.BillingStreet,
+      Account.BillingCity,
+      Account.BillingState,
+      Account.BillingPostalCode,
+      Account.BillingCountry,
+      Account.ShippingCity,
+      Account.ShippingCountry,
+      Account.Description,
+      Account.Owner.Name,
+      Account.Owner.Email,
+      Account.CreatedDate,
+      Account.LastModifiedDate,
+      Account.Rating,
+      Account.AccountSource
+    FROM Contact
+    WHERE Email = '${safeEmail}'
+    ORDER BY LastModifiedDate DESC
+    LIMIT 1
+  `.replace(/\s+/g, ' ').trim();
 
   const { data } = await client.get('/query', { params: { q: soql } });
-
   if (data.totalSize === 0) return null;
   return transformContact(data.records[0], instanceUrl);
+}
+
+function fmt(val) {
+  return val || null;
+}
+
+function fmtDate(val) {
+  if (!val) return null;
+  return new Date(val).toLocaleDateString('en-IN', {
+    day: '2-digit', month: 'short', year: 'numeric'
+  });
+}
+
+function fmtCurrency(val) {
+  if (!val) return null;
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(val);
+}
+
+function fmtAddress(...parts) {
+  return parts.filter(Boolean).join(', ') || null;
 }
 
 function transformContact(r, instanceUrl) {
   return {
     id: r.Id,
     name: r.Name || `${r.FirstName || ''} ${r.LastName || ''}`.trim(),
-    email: r.Email,
-    phone: r.Phone || r.MobilePhone || null,
-    title: r.Title || null,
-    department: r.Department || null,
-    account: r.Account
-      ? {
-          id: r.Account.Id,
-          name: r.Account.Name || null,
-          industry: r.Account.Industry || null,
-          billingCity: r.Account.BillingCity || null,
-          billingCountry: r.Account.BillingCountry || null,
-          website: r.Account.Website || null,
-          numberOfEmployees: r.Account.NumberOfEmployees || null,
-          ownerName: r.Account.Owner?.Name || null,
-        }
-      : null,
+    email: fmt(r.Email),
+    phone: fmt(r.Phone),
+    mobilePhone: fmt(r.MobilePhone),
+    homePhone: fmt(r.HomePhone),
+    otherPhone: fmt(r.OtherPhone),
+    fax: fmt(r.Fax),
+    title: fmt(r.Title),
+    department: fmt(r.Department),
+    birthdate: fmtDate(r.Birthdate),
+    leadSource: fmt(r.LeadSource),
+    description: fmt(r.Description),
+    mailingAddress: fmtAddress(r.MailingStreet, r.MailingCity, r.MailingState, r.MailingPostalCode, r.MailingCountry),
+    createdDate: fmtDate(r.CreatedDate),
+    lastModifiedDate: fmtDate(r.LastModifiedDate),
+    lastActivityDate: fmtDate(r.LastActivityDate),
+    ownerName: r.Owner?.Name || null,
+    ownerEmail: r.Owner?.Email || null,
+
+    account: r.Account ? {
+      id: r.Account.Id,
+      name: fmt(r.Account.Name),
+      type: fmt(r.Account.Type),
+      industry: fmt(r.Account.Industry),
+      phone: fmt(r.Account.Phone),
+      fax: fmt(r.Account.Fax),
+      website: fmt(r.Account.Website),
+      annualRevenue: fmtCurrency(r.Account.AnnualRevenue),
+      numberOfEmployees: r.Account.NumberOfEmployees ? r.Account.NumberOfEmployees.toLocaleString() : null,
+      rating: fmt(r.Account.Rating),
+      accountSource: fmt(r.Account.AccountSource),
+      description: fmt(r.Account.Description),
+      billingAddress: fmtAddress(r.Account.BillingStreet, r.Account.BillingCity, r.Account.BillingState, r.Account.BillingPostalCode, r.Account.BillingCountry),
+      shippingAddress: fmtAddress(r.Account.ShippingCity, r.Account.ShippingCountry),
+      ownerName: r.Account.Owner?.Name || null,
+      ownerEmail: r.Account.Owner?.Email || null,
+      createdDate: fmtDate(r.Account.CreatedDate),
+      lastModifiedDate: fmtDate(r.Account.LastModifiedDate),
+    } : null,
+
     salesforceUrl: `${instanceUrl}/lightning/r/Contact/${r.Id}/view`,
-    lastModified: r.LastModifiedDate,
+    accountUrl: r.Account?.Id ? `${instanceUrl}/lightning/r/Account/${r.Account.Id}/view` : null,
   };
 }
 
