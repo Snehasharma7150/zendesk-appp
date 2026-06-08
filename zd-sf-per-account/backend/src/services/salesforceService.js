@@ -1,66 +1,51 @@
-// src/services/salesforceService.js — Dynamic Fields Version
+// salesforceService.js — 100% Dynamic Fields
 const axios = require('axios');
 const logger = require('../utils/logger');
 
 const SF_API_VERSION = process.env.SF_API_VERSION || 'v59.0';
 
-// Field types jo skip karni hain (queryable nahi hoti ya useless hoti hain)
-const SKIP_TYPES = new Set(['address', 'location', 'base64']);
-const SKIP_NAMES = new Set([
-  'IsDeleted', 'MasterRecordId', 'IsEmailBounced',
-  'EmailBouncedReason', 'EmailBouncedDate',
+// In fields ko skip karo — internal Salesforce fields hain, user ke kaam ki nahi
+const SKIP_FIELD_NAMES = new Set([
+  'Id', 'IsDeleted', 'MasterRecordId', 'ReportsToId', 'AccountId',
+  'OwnerId', 'CreatedById', 'LastModifiedById', 'SystemModstamp',
+  'IsEmailBounced', 'EmailBouncedReason', 'EmailBouncedDate',
   'PhotoUrl', 'Jigsaw', 'JigsawContactId', 'IndividualId',
-  'SystemModstamp', 'LastCURequestDate', 'LastCUUpdateDate',
-  'LastViewedDate', 'LastReferencedDate',
-  'CleanStatus', 'ConnectionReceivedId', 'ConnectionSentId',
+  'LastCURequestDate', 'LastCUUpdateDate', 'LastViewedDate',
+  'LastReferencedDate', 'CleanStatus',
 ]);
+
+// In types ki fields skip karo — query mein nahi aa sakti
+const SKIP_FIELD_TYPES = new Set(['address', 'location', 'base64', 'anyType']);
 
 function buildClient(accessToken, instanceUrl) {
   return axios.create({
     baseURL: `${instanceUrl}/services/data/${SF_API_VERSION}`,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-    timeout: 15000,
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    timeout: 20000,
   });
 }
 
-// Salesforce metadata se object ke saare queryable fields fetch karo
-async function getObjectFields(client, objectName) {
-  try {
-    const { data } = await client.get(`/sobjects/${objectName}/describe`);
-    return data.fields.filter(f =>
-      f.queryable !== false &&
-      !SKIP_TYPES.has(f.type) &&
-      !SKIP_NAMES.has(f.name) &&
-      !f.name.endsWith('__pc') // person account internal fields
-    );
-  } catch (err) {
-    logger.error(`Failed to describe ${objectName}:`, err.message);
-    return [];
-  }
+// Salesforce object ke saare queryable fields describe API se lo
+async function describeObject(client, objectName) {
+  const { data } = await client.get(`/sobjects/${objectName}/describe`);
+  return data.fields.filter(f =>
+    !SKIP_FIELD_NAMES.has(f.name) &&
+    !SKIP_FIELD_TYPES.has(f.type) &&
+    f.type !== 'reference' // lookup/master-detail fields skip
+  );
 }
 
-// Field value ko human-readable format mein convert karo
+// Value ko display ke liye format karo
 function formatValue(field, value) {
   if (value === null || value === undefined || value === '') return null;
 
   switch (field.type) {
     case 'date':
-      return new Date(value).toLocaleDateString('en-IN', {
-        day: '2-digit', month: 'short', year: 'numeric'
-      });
+      return new Date(value).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
     case 'datetime':
-      return new Date(value).toLocaleString('en-IN', {
-        day: '2-digit', month: 'short', year: 'numeric',
-        hour: '2-digit', minute: '2-digit'
-      });
+      return new Date(value).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
     case 'currency':
-      return new Intl.NumberFormat('en-US', {
-        style: 'currency', currency: field.scale !== undefined ? 'USD' : 'USD',
-        maximumFractionDigits: 0
-      }).format(value);
+      return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(value);
     case 'percent':
       return `${value}%`;
     case 'boolean':
@@ -68,117 +53,96 @@ function formatValue(field, value) {
     case 'double':
     case 'integer':
     case 'long':
-      return typeof value === 'number' ? value.toLocaleString() : value;
+      return typeof value === 'number' ? value.toLocaleString() : String(value);
     default:
       return String(value);
   }
-}
-
-// Field ka label banana — API name se
-function getFieldLabel(field) {
-  return field.label || field.name
-    .replace(/__c$/i, '')
-    .replace(/_/g, ' ')
-    .replace(/([A-Z])/g, ' $1')
-    .trim();
 }
 
 async function findContactByEmail(accessToken, instanceUrl, email) {
   const client = buildClient(accessToken, instanceUrl);
   const safeEmail = email.replace(/'/g, "\\'");
 
-  // ── Step 1: Contact aur Account dono ke fields fetch karo ─────────────
-  const [contactFields, accountFields] = await Promise.all([
-    getObjectFields(client, 'Contact'),
-    getObjectFields(client, 'Account'),
+  // Step 1: Dono objects ke saare fields describe se lo
+  const [contactFieldDefs, accountFieldDefs] = await Promise.all([
+    describeObject(client, 'Contact'),
+    describeObject(client, 'Account'),
   ]);
 
-  // ── Step 2: Dynamic SOQL query banao ──────────────────────────────────
-  // Contact fields — direct
-  const contactFieldNames = contactFields
-    .filter(f => f.type !== 'reference' || f.name === 'OwnerId') // reference fields skip (except owner)
-    .map(f => f.name);
+  // Step 2: SOQL field list banao
+  const contactFieldNames = contactFieldDefs.map(f => f.name);
+  const accountFieldNames = accountFieldDefs.map(f => `Account.${f.name}`);
 
-  // Account fields — Account. prefix ke saath (non-reference only)
-  const accountFieldNames = accountFields
-    .filter(f => f.type !== 'reference' || f.name === 'OwnerId')
-    .map(f => `Account.${f.name}`);
+  // Owner ke naam manually add karo (ye reference fields hain isliye upar skip hue)
+  const manualFields = ['Owner.Name', 'Owner.Email', 'Account.Owner.Name', 'Account.Owner.Email', 'Account.Id'];
 
-  // Owner names manually add karo
-  const extraFields = ['Owner.Name', 'Owner.Email', 'Account.Owner.Name', 'Account.Owner.Email'];
+  const allFields = [...new Set([...contactFieldNames, ...accountFieldNames, ...manualFields])];
 
-  const allFields = [...new Set([...contactFieldNames, ...accountFieldNames, ...extraFields])];
-
+  // Step 3: Dynamic SOQL query
   const soql = `SELECT ${allFields.join(', ')} FROM Contact WHERE Email = '${safeEmail}' ORDER BY LastModifiedDate DESC LIMIT 1`;
-
-  logger.info(`Dynamic SOQL: fetching ${allFields.length} fields for contact`);
+  logger.info(`Fetching ${allFields.length} fields (contact: ${contactFieldDefs.length}, account: ${accountFieldDefs.length})`);
 
   const { data } = await client.get('/query', { params: { q: soql } });
   if (data.totalSize === 0) return null;
 
-  return transformContact(data.records[0], instanceUrl, contactFields, accountFields);
+  // Step 4: Record transform karo — saari fields ke saath label bhi bhejo
+  return buildResponse(data.records[0], instanceUrl, contactFieldDefs, accountFieldDefs);
 }
 
-function transformContact(record, instanceUrl, contactFieldDefs, accountFieldDefs) {
-  const result = {
+function buildResponse(record, instanceUrl, contactFieldDefs, accountFieldDefs) {
+  // Contact fields
+  const contactFields = [];
+  contactFieldDefs.forEach(field => {
+    const raw = record[field.name];
+    const value = formatValue(field, raw);
+    if (value === null) return; // empty fields mat bhejo
+    contactFields.push({
+      key: field.name,           // Salesforce API name
+      label: field.label,        // Human readable label from Salesforce itself
+      value,
+    });
+  });
+
+  // Owner manually add karo
+  if (record.Owner?.Name) {
+    contactFields.push({ key: 'OwnerName', label: 'Contact Owner', value: record.Owner.Name });
+  }
+
+  // Account fields
+  let accountFields = null;
+  if (record.Account) {
+    accountFields = [];
+    accountFieldDefs.forEach(field => {
+      const raw = record.Account[field.name];
+      const value = formatValue(field, raw);
+      if (value === null) return;
+      accountFields.push({
+        key: field.name,
+        label: field.label,
+        value,
+      });
+    });
+
+    if (record.Account.Owner?.Name) {
+      accountFields.push({ key: 'OwnerName', label: 'Account Owner', value: record.Account.Owner.Name });
+    }
+  }
+
+  return {
+    // Basic info for card header
     id: record.Id,
     name: record.Name || `${record.FirstName || ''} ${record.LastName || ''}`.trim(),
+    title: record.Title || null,
+    department: record.Department || null,
+
+    // Flat arrays — frontend dynamically render karega
+    contactFields,   // [{ key, label, value }, ...]
+    accountFields,   // [{ key, label, value }, ...] or null
+
+    accountId: record.Account?.Id || null,
     salesforceUrl: `${instanceUrl}/lightning/r/Contact/${record.Id}/view`,
     accountUrl: record.Account?.Id ? `${instanceUrl}/lightning/r/Account/${record.Account.Id}/view` : null,
   };
-
-  // ── Contact fields dynamically add karo ──────────────────────────────
-  contactFieldDefs.forEach(field => {
-    if (field.name === 'Id' || field.type === 'reference') return;
-    const raw = record[field.name];
-    const formatted = formatValue(field, raw);
-    if (formatted !== null) {
-      // camelCase key banana — frontend isse use karega
-      const key = fieldNameToKey(field.name);
-      result[key] = formatted;
-      // Label bhi store karo taaki frontend display kar sake
-      if (!result.__fieldMeta) result.__fieldMeta = {};
-      result.__fieldMeta[key] = getFieldLabel(field);
-    }
-  });
-
-  // ── Account fields dynamically add karo ──────────────────────────────
-  if (record.Account) {
-    const account = {
-      id: record.Account.Id,
-      salesforceUrl: `${instanceUrl}/lightning/r/Account/${record.Account.Id}/view`,
-    };
-
-    accountFieldDefs.forEach(field => {
-      if (field.name === 'Id' || field.type === 'reference') return;
-      const raw = record.Account[field.name];
-      const formatted = formatValue(field, raw);
-      if (formatted !== null) {
-        const key = fieldNameToKey(field.name);
-        account[key] = formatted;
-        if (!account.__fieldMeta) account.__fieldMeta = {};
-        account.__fieldMeta[key] = getFieldLabel(field);
-      }
-    });
-
-    // Owner names
-    if (record.Owner?.Name) result.ownerName = record.Owner.Name;
-    if (record.Account.Owner?.Name) account.ownerName = record.Account.Owner.Name;
-
-    result.account = account;
-  }
-
-  return result;
-}
-
-// Salesforce API name ko camelCase key mein convert karo
-// e.g. "MobilePhone" -> "mobilePhone", "Custom_Field__c" -> "customField"
-function fieldNameToKey(name) {
-  return name
-    .replace(/__c$/i, '')   // custom field suffix hata do
-    .replace(/__r$/i, '')   // relationship suffix hata do
-    .replace(/_+(.)/g, (_, c) => c.toUpperCase()) // underscore ke baad capital
-    .replace(/^(.)/, c => c.toLowerCase()); // pehla letter lowercase
 }
 
 module.exports = { findContactByEmail };
