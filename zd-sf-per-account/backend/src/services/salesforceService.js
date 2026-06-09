@@ -74,7 +74,7 @@ async function findContactByEmail(accessToken, instanceUrl, email) {
   const accountFieldNames = accountFieldDefs.map(f => `Account.${f.name}`);
 
   // Owner ke naam manually add karo (ye reference fields hain isliye upar skip hue)
-  const manualFields = ['Owner.Name', 'Owner.Email', 'Account.Owner.Name', 'Account.Owner.Email', 'Account.Id'];
+  const manualFields = ['Id', 'Account.Id', 'Owner.Name', 'Owner.Email', 'Account.Owner.Name', 'Account.Owner.Email'];
 
   const allFields = [...new Set([...contactFieldNames, ...accountFieldNames, ...manualFields])];
 
